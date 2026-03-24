@@ -1,0 +1,411 @@
+name: 'Nextie'
+description: 'Scan Next.js repos for issues using static analysis, auto-fix with tests, and create PRs. No API keys required — AI is optional.'
+branding:
+  icon: 'tool'
+  color: 'blue'
+
+inputs:
+  analyzers:
+    description: 'Comma-separated analyzer categories (typos,security,type-safety,error-handling,performance,code-quality,testing,nextjs)'
+    required: false
+  exclude:
+    description: 'Comma-separated glob patterns to exclude (e.g., "src/legacy/**,tests/**"). Also supports .nexteignore file.'
+    required: false
+  threshold:
+    description: 'Minimum confidence threshold 0-1 (default: 0.8)'
+    required: false
+    default: '0.8'
+  test-command:
+    description: 'Override the auto-detected test command'
+    required: false
+  base-branch:
+    description: 'Base branch for the PR'
+    required: false
+    default: 'main'
+  github-token:
+    description: 'GitHub token for creating PRs'
+    required: true
+  node-version:
+    description: 'Node.js version'
+    required: false
+    default: '20'
+  # Incremental mode options
+  incremental:
+    description: 'Run in incremental mode - process one fix at a time with test validation (default: true)'
+    required: false
+    default: 'true'
+  skip-on-fail:
+    description: 'Continue processing other fixes when one fails (default: true)'
+    required: false
+    default: 'true'
+  separate-prs:
+    description: 'Create separate PRs per analyzer category (default: false)'
+    required: false
+    default: 'false'
+  max-fixes:
+    description: 'Maximum number of fixes to apply (0 = unlimited)'
+    required: false
+    default: '0'
+  # Optional: AI-enhanced analysis (not required — static analysis works without these)
+  anthropic-api-key:
+    description: 'Anthropic API key to enable AI-enhanced analysis and fix suggestions (optional — static analysis runs without it)'
+    required: false
+  provider:
+    description: 'AI provider: anthropic or ollama (only used when an API key is provided)'
+    required: false
+  model:
+    description: 'AI model to use (only used when an API key is provided)'
+    required: false
+  debug:
+    description: 'Enable debug output (default: false)'
+    required: false
+    default: 'false'
+  review-mode:
+    description: 'Create PR with fixes as review suggestions instead of auto-committing (default: false)'
+    required: false
+    default: 'false'
+
+outputs:
+  pr-url:
+    description: 'URL of the created pull request (empty if no fixes)'
+    value: ${{ steps.create-pr.outputs.pr-url }}
+  fixes-committed:
+    description: 'Number of fixes successfully committed'
+    value: ${{ steps.run-nextie.outputs.fixes-committed }}
+  fixes-reverted:
+    description: 'Number of fixes reverted due to failing tests'
+    value: ${{ steps.run-nextie.outputs.fixes-reverted }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect package manager
+      shell: bash
+      id: detect-pm
+      run: |
+        if [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> $GITHUB_OUTPUT
+          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+        elif [ -f yarn.lock ]; then
+          echo "manager=yarn" >> $GITHUB_OUTPUT
+          echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
+        elif [ -f bun.lockb ]; then
+          echo "manager=bun" >> $GITHUB_OUTPUT
+          echo "lockfile=bun.lockb" >> $GITHUB_OUTPUT
+        else
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Enable corepack (pnpm/yarn)
+      shell: bash
+      if: steps.detect-pm.outputs.manager == 'pnpm' || steps.detect-pm.outputs.manager == 'yarn'
+      run: corepack enable
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ steps.detect-pm.outputs.manager }}
+
+    - name: Setup nextie
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/dist/nextie.mjs"
+        ln -sf "${{ github.action_path }}/dist/nextie.mjs" /usr/local/bin/nextie
+        # Install runtime dependencies for nextie (cspell-lib can't be bundled)
+        npm install --prefix "${{ github.action_path }}" cspell-lib@9
+
+    - name: Configure git
+      shell: bash
+      run: |
+        git config user.name "nextie[bot]"
+        git config user.email "nextie[bot]@users.noreply.github.com"
+
+    - name: Create fix branch
+      shell: bash
+      id: branch
+      run: |
+        BRANCH="nextie/$(date +%Y%m%d-%H%M%S)"
+        git checkout -b "$BRANCH"
+        echo "name=$BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Install project dependencies
+      shell: bash
+      run: |
+        case "${{ steps.detect-pm.outputs.manager }}" in
+          pnpm) pnpm install --frozen-lockfile ;;
+          yarn) yarn install --frozen-lockfile ;;
+          bun)  bun install --frozen-lockfile ;;
+          *)    npm ci ;;
+        esac
+
+    - name: Run nextie
+      shell: bash
+      id: run-nextie
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ -n "$ANTHROPIC_API_KEY" ]; then
+          echo "::notice::Running with AI-enhanced analysis (Anthropic)"
+        else
+          echo "::notice::Running with static analysis only (no AI key provided)"
+        fi
+
+        REVIEW_MODE="${{ inputs.review-mode }}"
+        if [ "$REVIEW_MODE" = "true" ]; then
+          ARGS="fix . --review"
+        else
+          ARGS="fix . --commit"
+        fi
+        ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+        ARGS="$ARGS --report-file /tmp/nextie-report.md"
+        ARGS="$ARGS --result-file /tmp/nextie-result.json"
+
+        if [ -n "${{ inputs.analyzers }}" ]; then
+          ARGS="$ARGS --analyzers ${{ inputs.analyzers }}"
+        fi
+        if [ -n "${{ inputs.exclude }}" ]; then
+          ARGS="$ARGS --exclude ${{ inputs.exclude }}"
+        fi
+        if [ -n "${{ inputs.provider }}" ]; then
+          ARGS="$ARGS --provider ${{ inputs.provider }}"
+        fi
+        if [ -n "${{ inputs.model }}" ]; then
+          ARGS="$ARGS --model ${{ inputs.model }}"
+        fi
+        if [ -n "${{ inputs.test-command }}" ]; then
+          ARGS="$ARGS --test-command '${{ inputs.test-command }}'"
+        fi
+
+        # Run non-interactively (stdin is not a tty in CI)
+        DEBUG="${{ inputs.debug }}"
+        [ "$DEBUG" = "true" ] && echo "Running: nextie $ARGS"
+        set -f  # Disable glob expansion so ** patterns aren't expanded by bash
+        echo "l" | nextie $ARGS || true
+        set +f  # Re-enable glob expansion
+
+        # Debug: show git status after nextie
+        if [ "$DEBUG" = "true" ]; then
+          echo "::group::Git status after nextie"
+          git status
+          git log --oneline -10
+          echo "::endgroup::"
+        fi
+
+        # Parse result file
+        if [ -f /tmp/nextie-result.json ]; then
+          if [ "$REVIEW_MODE" = "true" ]; then
+            # Review mode: count fixes
+            FIXES=$(jq '.fixes | length' /tmp/nextie-result.json)
+            COMMITTED=0
+            REVERTED=0
+            echo "fixes-pending=$FIXES" >> $GITHUB_OUTPUT
+          else
+            # Commit mode: count committed/reverted
+            COMMITTED=$(jq '.committed | length' /tmp/nextie-result.json)
+            REVERTED=$(jq '.reverted | length' /tmp/nextie-result.json)
+            FIXES=0
+          fi
+          if [ "$DEBUG" = "true" ]; then
+            echo "::group::Result file"
+            cat /tmp/nextie-result.json
+            echo "Committed: $COMMITTED, Reverted: $REVERTED, Fixes: $FIXES"
+            echo "::endgroup::"
+          fi
+        else
+          [ "$DEBUG" = "true" ] && echo "Result file not found"
+          COMMITTED=0
+          REVERTED=0
+          FIXES=0
+        fi
+
+        echo "fixes-committed=$COMMITTED" >> $GITHUB_OUTPUT
+        echo "fixes-reverted=$REVERTED" >> $GITHUB_OUTPUT
+        echo "review-mode=$REVIEW_MODE" >> $GITHUB_OUTPUT
+
+    - name: Create PR (commit mode)
+      shell: bash
+      id: create-pr
+      if: steps.run-nextie.outputs.fixes-committed != '0' && steps.run-nextie.outputs.review-mode != 'true'
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BRANCH="${{ steps.branch.outputs.name }}"
+        COMMITTED="${{ steps.run-nextie.outputs.fixes-committed }}"
+        git push origin "$BRANCH"
+
+        # Create nextie label if it doesn't exist
+        gh label create "nextie" --description "Automated fix by nextie" --color "5319E7" 2>/dev/null || true
+
+        # Get AI-generated PR title if available, otherwise use default
+        if [ -f /tmp/nextie-result.json ]; then
+          PR_TITLE=$(jq -r '.prTitle // empty' /tmp/nextie-result.json)
+        fi
+        if [ -z "$PR_TITLE" ]; then
+          PR_TITLE="fix: nextie $COMMITTED issue(s)"
+        fi
+
+        PR_URL=$(gh pr create \
+          --title "$PR_TITLE" \
+          --body-file /tmp/nextie-report.md \
+          --base "${{ inputs.base-branch }}" \
+          --head "$BRANCH" \
+          --label "nextie")
+
+        echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
+        echo "Created PR: $PR_URL"
+
+    - name: Create review PR
+      shell: bash
+      id: create-review-pr
+      if: steps.run-nextie.outputs.review-mode == 'true' && steps.run-nextie.outputs.fixes-pending != '0'
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BRANCH="${{ steps.branch.outputs.name }}"
+        FIXES="${{ steps.run-nextie.outputs.fixes-pending }}"
+
+        # Create placeholder commit with pending fixes
+        mkdir -p .nextie
+        cp /tmp/nextie-result.json .nextie/pending-fixes.json
+        git add .nextie/pending-fixes.json
+        git commit -m "chore: nextie review - $FIXES pending fix(es)"
+
+        git push origin "$BRANCH"
+
+        # Create nextie label
+        gh label create "nextie" --description "Automated fix by nextie" --color "5319E7" 2>/dev/null || true
+        gh label create "nextie-review" --description "Nextie review mode - apply suggestions" --color "FBCA04" 2>/dev/null || true
+
+        # Create PR body for review mode
+        cat > /tmp/nextie-review-body.md << 'REVIEWEOF'
+        # Nextie Review
+
+        This PR contains **$FIXES** suggested fix(es) for review.
+
+        ## How to apply fixes
+
+        Each fix is posted as a **GitHub suggestion** comment on the relevant lines.
+        - Click **"Apply suggestion"** to apply individual fixes
+        - Click **"Commit suggestions"** to apply multiple at once
+
+        For fixes that can't be suggestions (new files, multi-file changes), see the summary comment below.
+
+        ---
+        *Review mode: fixes are not auto-committed. You choose which to apply.*
+        REVIEWEOF
+
+        sed -i "s/\$FIXES/$FIXES/g" /tmp/nextie-review-body.md
+
+        PR_URL=$(gh pr create \
+          --title "fix: nextie review - $FIXES suggested fix(es)" \
+          --body-file /tmp/nextie-review-body.md \
+          --base "${{ inputs.base-branch }}" \
+          --head "$BRANCH" \
+          --label "nextie" \
+          --label "nextie-review")
+
+        echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
+        echo "pr-number=$(gh pr view "$PR_URL" --json number -q .number)" >> $GITHUB_OUTPUT
+        echo "Created review PR: $PR_URL"
+
+    - name: Post review suggestions
+      shell: bash
+      if: steps.create-review-pr.outputs.pr-number != ''
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        PR_NUMBER="${{ steps.create-review-pr.outputs.pr-number }}"
+        COMMIT_SHA=$(git rev-parse HEAD)
+
+        # Read fixes and post as review comments with suggestions
+        jq -c '.fixes[]' /tmp/nextie-result.json | while read -r fix; do
+          CAN_SUGGEST=$(echo "$fix" | jq -r '.canBeSuggestion')
+          NEW_TEXT=$(echo "$fix" | jq -r '.edits[0].newText // empty')
+
+          if [ "$CAN_SUGGEST" = "true" ] && [ -n "$NEW_TEXT" ]; then
+            FILE=$(echo "$fix" | jq -r '.file')
+            END_LINE=$(echo "$fix" | jq -r '.endLine')
+            MESSAGE=$(echo "$fix" | jq -r '.message')
+            DESCRIPTION=$(echo "$fix" | jq -r '.description')
+            CATEGORY=$(echo "$fix" | jq -r '.category')
+
+            # Build suggestion body with proper markdown formatting
+            # Using printf to handle newlines and special characters
+            BODY=$(printf '**%s**: %s\n\n%s\n\n```suggestion\n%s\n```' \
+              "$CATEGORY" "$MESSAGE" "$DESCRIPTION" "$NEW_TEXT")
+
+            # Use gh api to post review comment
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/pulls/$PR_NUMBER/comments" \
+              -f commit_id="$COMMIT_SHA" \
+              -f path="$FILE" \
+              -F line="$END_LINE" \
+              -f side="RIGHT" \
+              -f body="$BODY" || echo "Failed to post suggestion for $FILE:$END_LINE"
+          fi
+        done
+
+        echo "::notice::Posted review suggestions to PR #$PR_NUMBER"
+
+    - name: Post non-suggestion summary
+      shell: bash
+      if: steps.create-review-pr.outputs.pr-number != ''
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        PR_NUMBER="${{ steps.create-review-pr.outputs.pr-number }}"
+
+        # Check if there are any non-suggestion fixes
+        NON_SUGGESTION_COUNT=$(jq '[.fixes[] | select(.canBeSuggestion == false)] | length' /tmp/nextie-result.json)
+
+        if [ "$NON_SUGGESTION_COUNT" -gt 0 ]; then
+          # Build summary comment for fixes that can't be suggestions
+          {
+            echo "## Fixes requiring manual review"
+            echo ""
+            echo "The following **$NON_SUGGESTION_COUNT** fix(es) cannot be applied as GitHub suggestions (multi-file changes or new files):"
+            echo ""
+
+            # Add each non-suggestion fix
+            jq -c '.fixes[] | select(.canBeSuggestion == false)' /tmp/nextie-result.json | while read -r fix; do
+              FILE=$(echo "$fix" | jq -r '.file')
+              LINE=$(echo "$fix" | jq -r '.line')
+              CATEGORY=$(echo "$fix" | jq -r '.category')
+              MESSAGE=$(echo "$fix" | jq -r '.message')
+              DESCRIPTION=$(echo "$fix" | jq -r '.description')
+              NEW_TEXT=$(echo "$fix" | jq -r '.edits[0].newText // "New file: see edits below"')
+
+              echo "### $FILE:$LINE"
+              echo "**$CATEGORY**: $MESSAGE"
+              echo ""
+              echo "$DESCRIPTION"
+              echo ""
+              echo "<details>"
+              echo "<summary>View changes</summary>"
+              echo ""
+              echo '```diff'
+              echo "$NEW_TEXT"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            done
+
+            echo "---"
+            echo "*Apply these changes manually by copying the code from the diff above.*"
+          } > /tmp/non-suggestion-body.txt
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            -F body=@/tmp/non-suggestion-body.txt || echo "Failed to post non-suggestion summary"
+
+          echo "::notice::Posted summary for $NON_SUGGESTION_COUNT non-suggestion fixes"
+        fi
+
