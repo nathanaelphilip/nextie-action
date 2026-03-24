@@ -1,0 +1,210 @@
+name: 'Nextie'
+description: 'Scan Next.js repos for issues using static analysis, auto-fix with tests, and create PRs. No API keys required — AI is optional.'
+branding:
+  icon: 'tool'
+  color: 'blue'
+
+inputs:
+  analyzers:
+    description: 'Comma-separated analyzer categories (typos,security,type-safety,error-handling,performance,code-quality,testing,nextjs)'
+    required: false
+  exclude:
+    description: 'Comma-separated glob patterns to exclude (e.g., "src/legacy/**,tests/**"). Also supports .nexteignore file.'
+    required: false
+  threshold:
+    description: 'Minimum confidence threshold 0-1 (default: 0.8)'
+    required: false
+    default: '0.8'
+  test-command:
+    description: 'Override the auto-detected test command'
+    required: false
+  base-branch:
+    description: 'Base branch for the PR'
+    required: false
+    default: 'main'
+  github-token:
+    description: 'GitHub token for creating PRs'
+    required: true
+  node-version:
+    description: 'Node.js version'
+    required: false
+    default: '20'
+  # Incremental mode options
+  incremental:
+    description: 'Run in incremental mode - process one fix at a time with test validation (default: true)'
+    required: false
+    default: 'true'
+  skip-on-fail:
+    description: 'Continue processing other fixes when one fails (default: true)'
+    required: false
+    default: 'true'
+  separate-prs:
+    description: 'Create separate PRs per analyzer category (default: false)'
+    required: false
+    default: 'false'
+  max-fixes:
+    description: 'Maximum number of fixes to apply (0 = unlimited)'
+    required: false
+    default: '0'
+  # Optional: AI-enhanced analysis (not required — static analysis works without these)
+  anthropic-api-key:
+    description: 'Anthropic API key to enable AI-enhanced analysis and fix suggestions (optional — static analysis runs without it)'
+    required: false
+  provider:
+    description: 'AI provider: anthropic or ollama (only used when an API key is provided)'
+    required: false
+  model:
+    description: 'AI model to use (only used when an API key is provided)'
+    required: false
+
+outputs:
+  pr-url:
+    description: 'URL of the created pull request (empty if no fixes)'
+    value: ${{ steps.create-pr.outputs.pr-url }}
+  fixes-committed:
+    description: 'Number of fixes successfully committed'
+    value: ${{ steps.run-nextie.outputs.fixes-committed }}
+  fixes-reverted:
+    description: 'Number of fixes reverted due to failing tests'
+    value: ${{ steps.run-nextie.outputs.fixes-reverted }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Setup nextie
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/dist/nextie.mjs"
+        ln -sf "${{ github.action_path }}/dist/nextie.mjs" /usr/local/bin/nextie
+        # Install runtime dependencies for nextie (cspell-lib can't be bundled)
+        npm install --prefix "${{ github.action_path }}" cspell-lib@9
+
+    - name: Configure git
+      shell: bash
+      run: |
+        git config user.name "nextie[bot]"
+        git config user.email "nextie[bot]@users.noreply.github.com"
+
+    - name: Create fix branch
+      shell: bash
+      id: branch
+      run: |
+        BRANCH="nextie/$(date +%Y%m%d-%H%M%S)"
+        git checkout -b "$BRANCH"
+        echo "name=$BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Install project dependencies
+      shell: bash
+      run: |
+        if [ -f pnpm-lock.yaml ]; then
+          corepack enable && corepack prepare pnpm@latest --activate
+          pnpm install --frozen-lockfile
+        elif [ -f yarn.lock ]; then
+          yarn install --frozen-lockfile
+        elif [ -f bun.lockb ]; then
+          bun install --frozen-lockfile
+        else
+          npm ci
+        fi
+
+    - name: Run nextie
+      shell: bash
+      id: run-nextie
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ -n "$ANTHROPIC_API_KEY" ]; then
+          echo "::notice::Running with AI-enhanced analysis (Anthropic)"
+        else
+          echo "::notice::Running with static analysis only (no AI key provided)"
+        fi
+
+        ARGS="fix . --commit"
+        ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+        ARGS="$ARGS --report-file /tmp/nextie-report.md"
+        ARGS="$ARGS --result-file /tmp/nextie-result.json"
+
+        if [ -n "${{ inputs.analyzers }}" ]; then
+          ARGS="$ARGS --analyzers ${{ inputs.analyzers }}"
+        fi
+        if [ -n "${{ inputs.exclude }}" ]; then
+          ARGS="$ARGS --exclude ${{ inputs.exclude }}"
+        fi
+        if [ -n "${{ inputs.provider }}" ]; then
+          ARGS="$ARGS --provider ${{ inputs.provider }}"
+        fi
+        if [ -n "${{ inputs.model }}" ]; then
+          ARGS="$ARGS --model ${{ inputs.model }}"
+        fi
+        if [ -n "${{ inputs.test-command }}" ]; then
+          ARGS="$ARGS --test-command '${{ inputs.test-command }}'"
+        fi
+
+        # Run non-interactively (stdin is not a tty in CI)
+        echo "Running: nextie $ARGS"
+        set -f  # Disable glob expansion so ** patterns aren't expanded by bash
+        echo "l" | nextie $ARGS || true
+        set +f  # Re-enable glob expansion
+
+        # Debug: show git status after nextie
+        echo "::group::Git status after nextie"
+        git status
+        git log --oneline -10
+        echo "::endgroup::"
+
+        # Debug: show result file
+        echo "::group::Result file"
+        if [ -f /tmp/nextie-result.json ]; then
+          cat /tmp/nextie-result.json
+          COMMITTED=$(jq '.committed | length' /tmp/nextie-result.json)
+          REVERTED=$(jq '.reverted | length' /tmp/nextie-result.json)
+          echo "Committed: $COMMITTED, Reverted: $REVERTED"
+        else
+          echo "Result file not found"
+          COMMITTED=0
+          REVERTED=0
+        fi
+        echo "::endgroup::"
+
+        echo "fixes-committed=$COMMITTED" >> $GITHUB_OUTPUT
+        echo "fixes-reverted=$REVERTED" >> $GITHUB_OUTPUT
+        echo "DEBUG: fixes-committed output set to: $COMMITTED"
+
+    - name: Create PR
+      shell: bash
+      id: create-pr
+      if: steps.run-nextie.outputs.fixes-committed != '0'
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BRANCH="${{ steps.branch.outputs.name }}"
+        COMMITTED="${{ steps.run-nextie.outputs.fixes-committed }}"
+        git push origin "$BRANCH"
+
+        # Create nextie label if it doesn't exist
+        gh label create "nextie" --description "Automated fix by nextie" --color "5319E7" 2>/dev/null || true
+
+        # Get AI-generated PR title if available, otherwise use default
+        if [ -f /tmp/nextie-result.json ]; then
+          PR_TITLE=$(jq -r '.prTitle // empty' /tmp/nextie-result.json)
+        fi
+        if [ -z "$PR_TITLE" ]; then
+          PR_TITLE="fix: nextie $COMMITTED issue(s)"
+        fi
+
+        PR_URL=$(gh pr create \
+          --title "$PR_TITLE" \
+          --body-file /tmp/nextie-report.md \
+          --base "${{ inputs.base-branch }}" \
+          --head "$BRANCH" \
+          --label "nextie")
+
+        echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
+        echo "Created PR: $PR_URL"
+
