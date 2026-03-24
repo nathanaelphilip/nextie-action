@@ -1,0 +1,430 @@
+name: 'Nextie'
+description: 'Scan Next.js repos for issues using static analysis, auto-fix with tests, and create PRs. No API keys required — AI is optional.'
+branding:
+  icon: 'tool'
+  color: 'blue'
+
+inputs:
+  analyzers:
+    description: 'Comma-separated analyzer categories (typos,security,type-safety,error-handling,performance,code-quality,testing,nextjs)'
+    required: false
+  exclude:
+    description: 'Comma-separated glob patterns to exclude (e.g., "src/legacy/**,tests/**"). Also supports .nexteignore file.'
+    required: false
+  threshold:
+    description: 'Minimum confidence threshold 0-1 (default: 0.8)'
+    required: false
+    default: '0.8'
+  test-command:
+    description: 'Override the auto-detected test command'
+    required: false
+  base-branch:
+    description: 'Base branch for the PR'
+    required: false
+    default: 'main'
+  github-token:
+    description: 'GitHub token for creating PRs'
+    required: true
+  node-version:
+    description: 'Node.js version'
+    required: false
+    default: '20'
+  # Incremental mode options
+  incremental:
+    description: 'Run in incremental mode - process one fix at a time with test validation (default: true)'
+    required: false
+    default: 'true'
+  skip-on-fail:
+    description: 'Continue processing other fixes when one fails (default: true)'
+    required: false
+    default: 'true'
+  separate-prs:
+    description: 'Create separate PRs per analyzer category (default: false)'
+    required: false
+    default: 'false'
+  max-fixes:
+    description: 'Maximum number of fixes to apply (0 = unlimited)'
+    required: false
+    default: '0'
+  # Optional: AI-enhanced analysis (not required — static analysis works without these)
+  anthropic-api-key:
+    description: 'Anthropic API key to enable AI-enhanced analysis and fix suggestions (optional — static analysis runs without it)'
+    required: false
+  provider:
+    description: 'AI provider: anthropic or ollama (only used when an API key is provided)'
+    required: false
+  model:
+    description: 'AI model to use (only used when an API key is provided)'
+    required: false
+  debug:
+    description: 'Enable debug output (default: false)'
+    required: false
+    default: 'false'
+  review-mode:
+    description: 'Create one PR per fix for review instead of auto-committing (default: false, max 5 PRs)'
+    required: false
+    default: 'false'
+
+outputs:
+  pr-url:
+    description: 'URL of the created pull request (empty if no fixes)'
+    value: ${{ steps.create-pr.outputs.pr-url || steps.create-review-prs.outputs.first-pr-url }}
+  pr-urls:
+    description: 'Newline-separated URLs of all created review PRs'
+    value: ${{ steps.create-review-prs.outputs.pr-urls }}
+  prs-created:
+    description: 'Number of review PRs created'
+    value: ${{ steps.create-review-prs.outputs.prs-created }}
+  fixes-committed:
+    description: 'Number of fixes successfully committed'
+    value: ${{ steps.run-nextie.outputs.fixes-committed }}
+  fixes-reverted:
+    description: 'Number of fixes reverted due to failing tests'
+    value: ${{ steps.run-nextie.outputs.fixes-reverted }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect package manager
+      shell: bash
+      id: detect-pm
+      run: |
+        if [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> $GITHUB_OUTPUT
+          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+        elif [ -f yarn.lock ]; then
+          echo "manager=yarn" >> $GITHUB_OUTPUT
+          echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
+        elif [ -f bun.lockb ]; then
+          echo "manager=bun" >> $GITHUB_OUTPUT
+          echo "lockfile=bun.lockb" >> $GITHUB_OUTPUT
+        else
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Enable corepack (pnpm/yarn)
+      shell: bash
+      if: steps.detect-pm.outputs.manager == 'pnpm' || steps.detect-pm.outputs.manager == 'yarn'
+      run: corepack enable
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ steps.detect-pm.outputs.manager }}
+
+    - name: Setup nextie
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/dist/nextie.mjs"
+        ln -sf "${{ github.action_path }}/dist/nextie.mjs" /usr/local/bin/nextie
+        # Install runtime dependencies for nextie (cspell-lib can't be bundled)
+        npm install --prefix "${{ github.action_path }}" cspell-lib@9
+
+    - name: Configure git
+      shell: bash
+      run: |
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+    - name: Create fix branch
+      shell: bash
+      id: branch
+      if: inputs.review-mode != 'true'
+      run: |
+        BRANCH="nextie/$(date +%Y%m%d-%H%M%S)"
+        git checkout -b "$BRANCH"
+        echo "name=$BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Install project dependencies
+      shell: bash
+      run: |
+        case "${{ steps.detect-pm.outputs.manager }}" in
+          pnpm) pnpm install --frozen-lockfile ;;
+          yarn) yarn install --frozen-lockfile ;;
+          bun)  bun install --frozen-lockfile ;;
+          *)    npm ci ;;
+        esac
+
+    - name: Run nextie
+      shell: bash
+      id: run-nextie
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ -n "$ANTHROPIC_API_KEY" ]; then
+          echo "::notice::Running with AI-enhanced analysis (Anthropic)"
+        else
+          echo "::notice::Running with static analysis only (no AI key provided)"
+        fi
+
+        REVIEW_MODE="${{ inputs.review-mode }}"
+        if [ "$REVIEW_MODE" = "true" ]; then
+          ARGS="fix . --review"
+        else
+          ARGS="fix . --commit"
+        fi
+        ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+        ARGS="$ARGS --report-file /tmp/nextie-report.md"
+        ARGS="$ARGS --result-file /tmp/nextie-result.json"
+
+        if [ -n "${{ inputs.analyzers }}" ]; then
+          ARGS="$ARGS --analyzers ${{ inputs.analyzers }}"
+        fi
+        if [ -n "${{ inputs.exclude }}" ]; then
+          ARGS="$ARGS --exclude ${{ inputs.exclude }}"
+        fi
+        if [ -n "${{ inputs.provider }}" ]; then
+          ARGS="$ARGS --provider ${{ inputs.provider }}"
+        fi
+        if [ -n "${{ inputs.model }}" ]; then
+          ARGS="$ARGS --model ${{ inputs.model }}"
+        fi
+        if [ -n "${{ inputs.test-command }}" ]; then
+          ARGS="$ARGS --test-command '${{ inputs.test-command }}'"
+        fi
+
+        # Run non-interactively (stdin is not a tty in CI)
+        DEBUG="${{ inputs.debug }}"
+        [ "$DEBUG" = "true" ] && echo "Running: nextie $ARGS"
+        set -f  # Disable glob expansion so ** patterns aren't expanded by bash
+        echo "l" | nextie $ARGS || true
+        set +f  # Re-enable glob expansion
+
+        # Debug: show git status after nextie
+        if [ "$DEBUG" = "true" ]; then
+          echo "::group::Git status after nextie"
+          git status
+          git log --oneline -10
+          echo "::endgroup::"
+        fi
+
+        # Parse result file
+        if [ -f /tmp/nextie-result.json ]; then
+          if [ "$REVIEW_MODE" = "true" ]; then
+            # Review mode: count fixes
+            FIXES=$(jq '.fixes | length' /tmp/nextie-result.json)
+            COMMITTED=0
+            REVERTED=0
+            echo "fixes-pending=$FIXES" >> $GITHUB_OUTPUT
+          else
+            # Commit mode: count committed/reverted
+            COMMITTED=$(jq '.committed | length' /tmp/nextie-result.json)
+            REVERTED=$(jq '.reverted | length' /tmp/nextie-result.json)
+            FIXES=0
+          fi
+          if [ "$DEBUG" = "true" ]; then
+            echo "::group::Result file"
+            cat /tmp/nextie-result.json
+            echo "Committed: $COMMITTED, Reverted: $REVERTED, Fixes: $FIXES"
+            echo "::endgroup::"
+          fi
+        else
+          [ "$DEBUG" = "true" ] && echo "Result file not found"
+          COMMITTED=0
+          REVERTED=0
+          FIXES=0
+        fi
+
+        echo "fixes-committed=$COMMITTED" >> $GITHUB_OUTPUT
+        echo "fixes-reverted=$REVERTED" >> $GITHUB_OUTPUT
+        echo "review-mode=$REVIEW_MODE" >> $GITHUB_OUTPUT
+
+    - name: Create PR (commit mode)
+      shell: bash
+      id: create-pr
+      if: steps.run-nextie.outputs.fixes-committed != '0' && steps.run-nextie.outputs.review-mode != 'true'
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BRANCH="${{ steps.branch.outputs.name }}"
+        COMMITTED="${{ steps.run-nextie.outputs.fixes-committed }}"
+        git push origin "$BRANCH"
+
+        # Create nextie label if it doesn't exist
+        gh label create "nextie" --description "Automated fix by nextie" --color "5319E7" 2>/dev/null || true
+
+        # Get AI-generated PR title if available, otherwise use default
+        if [ -f /tmp/nextie-result.json ]; then
+          PR_TITLE=$(jq -r '.prTitle // empty' /tmp/nextie-result.json)
+        fi
+        if [ -z "$PR_TITLE" ]; then
+          PR_TITLE="fix: nextie $COMMITTED issue(s)"
+        fi
+
+        PR_URL=$(gh pr create \
+          --title "$PR_TITLE" \
+          --body-file /tmp/nextie-report.md \
+          --base "${{ inputs.base-branch }}" \
+          --head "$BRANCH" \
+          --label "nextie")
+
+        echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
+        echo "Created PR: $PR_URL"
+
+    - name: Create review PRs (one per fix)
+      shell: bash
+      id: create-review-prs
+      if: steps.run-nextie.outputs.review-mode == 'true' && steps.run-nextie.outputs.fixes-pending != '0'
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BASE="${{ inputs.base-branch }}"
+        MAX_PRS=5
+        CREATED=0
+        SKIPPED=0
+        FIRST_PR_URL=""
+        PR_URLS=""
+
+        # Create labels
+        gh label create "nextie" --description "Automated fix by nextie" --color "5319E7" 2>/dev/null || true
+        gh label create "nextie-review" --description "Nextie review - merge or close to skip" --color "FBCA04" 2>/dev/null || true
+
+        # Clean up branches from closed/merged nextie-review PRs
+        STALE_BRANCHES=$(gh pr list \
+          --state closed \
+          --label "nextie-review" \
+          --json headRefName \
+          --jq '.[].headRefName' 2>/dev/null || true)
+
+        if [ -n "$STALE_BRANCHES" ]; then
+          CLEANED=0
+          for branch in $STALE_BRANCHES; do
+            if git push origin --delete "$branch" 2>/dev/null; then
+              CLEANED=$((CLEANED + 1))
+            fi
+          done
+          if [ "$CLEANED" -gt 0 ]; then
+            echo "::notice::Cleaned up $CLEANED stale nextie branch(es)"
+          fi
+        fi
+
+        # Collect fingerprints from closed (unmerged) nextie-review PRs
+        SKIPPED_FPS=$(gh pr list \
+          --state closed \
+          --label "nextie-review" \
+          --json body,mergedAt \
+          --jq '[.[] | select(.mergedAt == null) | .body | capture("<!-- nextie-fingerprint:(?<fp>[a-f0-9]+) -->") | .fp] | .[]' \
+          2>/dev/null || true)
+
+        # Also collect fingerprints from open nextie-review PRs (avoid duplicates)
+        OPEN_FPS=$(gh pr list \
+          --state open \
+          --label "nextie-review" \
+          --json body \
+          --jq '[.[] | .body | capture("<!-- nextie-fingerprint:(?<fp>[a-f0-9]+) -->") | .fp] | .[]' \
+          2>/dev/null || true)
+
+        SKIP_SET=$(printf '%s\n%s' "$SKIPPED_FPS" "$OPEN_FPS")
+
+        # Save current HEAD so we can reset between fixes
+        BASE_SHA=$(git rev-parse HEAD)
+
+        # Write each fix to a separate file so we can iterate without subshells
+        FIX_COUNT=$(jq '.fixes | length' /tmp/nextie-result.json)
+        for i in $(seq 0 $((FIX_COUNT - 1))); do
+          jq -c ".fixes[$i]" /tmp/nextie-result.json > "/tmp/nextie-fix-${i}.json"
+        done
+
+        # Process each fix
+        for i in $(seq 0 $((FIX_COUNT - 1))); do
+          if [ "$CREATED" -ge "$MAX_PRS" ]; then
+            break
+          fi
+
+          fix=$(cat "/tmp/nextie-fix-${i}.json")
+
+          # Compute fingerprint
+          CATEGORY=$(echo "$fix" | jq -r '.category')
+          FILE=$(echo "$fix" | jq -r '.file')
+          LINE=$(echo "$fix" | jq -r '.line')
+          MESSAGE=$(echo "$fix" | jq -r '.message')
+          DESCRIPTION=$(echo "$fix" | jq -r '.description')
+          EDITS_KEY=$(echo "$fix" | jq -r '[.edits[] | .file + ":" + .newText] | join("\u0000")')
+          NEW_FILES_KEY=$(echo "$fix" | jq -r '[.newFiles[] | .path + ":" + .content] | join("\u0000")')
+
+          FINGERPRINT=$(printf '%s\0%s\0%s\0%s\0%s' "$CATEGORY" "$FILE" "$MESSAGE" "$EDITS_KEY" "$NEW_FILES_KEY" | shasum -a 256 | cut -c1-16)
+
+          # Skip if already suggested or skipped
+          if echo "$SKIP_SET" | grep -qF "$FINGERPRINT"; then
+            SKIPPED=$((SKIPPED + 1))
+            continue
+          fi
+
+          # Create branch name from fix details
+          SLUG=$(echo "$MESSAGE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-40 | sed 's/-$//')
+          BRANCH="nextie/review/${CATEGORY}/${SLUG}-${FINGERPRINT:0:8}"
+
+          # Reset to base and create new branch
+          git checkout "$BASE" --force 2>/dev/null
+          git clean -fd 2>/dev/null
+          git checkout -b "$BRANCH" "$BASE_SHA" 2>/dev/null || {
+            # Branch may already exist from a previous interrupted run
+            git branch -D "$BRANCH" 2>/dev/null
+            git checkout -b "$BRANCH" "$BASE_SHA"
+          }
+
+          # Apply fix using nextie CLI
+          nextie apply-fix "/tmp/nextie-fix-${i}.json" .
+
+          # Commit and push
+          git add .
+          git commit -m "fix(${CATEGORY}): ${MESSAGE}"
+          git push origin "$BRANCH" --set-upstream --force
+
+          # Build PR body
+          {
+            echo "## Nextie: ${CATEGORY}"
+            echo ""
+            echo "**${FILE}:${LINE}** — ${MESSAGE}"
+            echo ""
+            echo "${DESCRIPTION}"
+            echo ""
+
+            EDIT_COUNT=$(echo "$fix" | jq '.edits | length')
+            if [ "$EDIT_COUNT" -gt 0 ]; then
+              echo "### Changes"
+              echo ""
+              echo "$fix" | jq -r '.edits[] | "**`\(.file):\(.startLine)-\(.endLine)`**\n```diff\n\(.newText | split("\n") | map("+ " + .) | join("\n"))\n```\n"'
+            fi
+
+            NEW_FILE_COUNT=$(echo "$fix" | jq '.newFiles | length')
+            if [ "$NEW_FILE_COUNT" -gt 0 ]; then
+              echo "### New files"
+              echo "$fix" | jq -r '.newFiles[] | "- `\(.path)`"'
+              echo ""
+            fi
+
+            echo "---"
+            echo "> Merge this PR to apply the fix, or close it to skip."
+            echo "> Generated by [nextie](https://github.com/functionform/nextie)"
+            echo ""
+            echo "<!-- nextie-fingerprint:${FINGERPRINT} -->"
+          } > /tmp/nextie-pr-body.md
+
+          PR_TITLE=$(echo "fix(${CATEGORY}): ${MESSAGE}" | cut -c1-72)
+
+          PR_URL=$(gh pr create \
+            --title "$PR_TITLE" \
+            --body-file /tmp/nextie-pr-body.md \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --label "nextie" \
+            --label "nextie-review")
+
+          if [ -z "$FIRST_PR_URL" ]; then
+            FIRST_PR_URL="$PR_URL"
+          fi
+          PR_URLS="${PR_URLS}${PR_URL}\n"
+          CREATED=$((CREATED + 1))
+
+          echo "::notice::Created review PR: $PR_URL"
+        done
+
+        echo "first-pr-url=$FIRST_PR_URL" >> $GITHUB_OUTPUT
+        echo "pr-urls=$PR_URLS" >> $GITHUB_OUTPUT
+        echo "prs-created=$CREATED" >> $GITHUB_OUTPUT
+        echo "::notice::Created $CREATED review PRs ($SKIPPED skipped as already suggested/closed)"
+
