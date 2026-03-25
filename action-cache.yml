@@ -1,0 +1,235 @@
+name: 'Nextie Cache'
+description: 'Analyze Next.js projects for caching opportunities and create PRs with use cache directives.'
+branding:
+  icon: 'zap'
+  color: 'green'
+
+inputs:
+  base-branch:
+    description: 'Base branch for PRs'
+    required: false
+    default: 'main'
+  github-token:
+    description: 'GitHub token for creating PRs'
+    required: true
+  node-version:
+    description: 'Node.js version'
+    required: false
+    default: '20'
+  profile:
+    description: 'Default cache profile: default, minutes, hours, days, weeks, max'
+    required: false
+    default: 'hours'
+  debug:
+    description: 'Enable debug output (default: false)'
+    required: false
+    default: 'false'
+
+outputs:
+  pr-url:
+    description: 'URL of the first created pull request'
+    value: ${{ steps.create-cache-prs.outputs.first-pr-url }}
+  pr-urls:
+    description: 'Newline-separated URLs of all created cache PRs'
+    value: ${{ steps.create-cache-prs.outputs.pr-urls }}
+  prs-created:
+    description: 'Number of cache PRs created'
+    value: ${{ steps.create-cache-prs.outputs.prs-created }}
+  opportunities:
+    description: 'Number of caching opportunities found'
+    value: ${{ steps.run-cache.outputs.opportunities }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Setup nextie
+      shell: bash
+      run: |
+        ln -sf "${{ github.action_path }}/dist/nextie.mjs" /usr/local/bin/nextie
+
+    - name: Configure git
+      shell: bash
+      run: |
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+    - name: Install project dependencies
+      shell: bash
+      run: |
+        if [ -f pnpm-lock.yaml ]; then
+          npm i -g pnpm && pnpm install --frozen-lockfile
+        elif [ -f yarn.lock ]; then
+          yarn install --frozen-lockfile
+        elif [ -f bun.lockb ]; then
+          npm i -g bun && bun install --frozen-lockfile
+        else
+          npm ci
+        fi
+
+    - name: Run cache analysis
+      shell: bash
+      id: run-cache
+      run: |
+        nextie cache . --result-file /tmp/nextie-cache-result.json --profile ${{ inputs.profile }}
+
+        if [ -f /tmp/nextie-cache-result.json ]; then
+          OPPORTUNITIES=$(jq '.totalFindings // 0' /tmp/nextie-cache-result.json)
+          FIXES=$(jq '.totalFixes // 0' /tmp/nextie-cache-result.json)
+        else
+          OPPORTUNITIES=0
+          FIXES=0
+        fi
+
+        echo "opportunities=$OPPORTUNITIES" >> $GITHUB_OUTPUT
+        echo "fixes=$FIXES" >> $GITHUB_OUTPUT
+
+        if [ "${{ inputs.debug }}" = "true" ]; then
+          echo "::group::Cache analysis result"
+          cat /tmp/nextie-cache-result.json 2>/dev/null || echo "No result file"
+          echo "::endgroup::"
+        fi
+
+    - name: Create cache PRs (one per fix)
+      shell: bash
+      id: create-cache-prs
+      if: steps.run-cache.outputs.fixes != '0'
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BASE="${{ inputs.base-branch }}"
+        MAX_PRS=5
+        CREATED=0
+        SKIPPED=0
+        FIRST_PR_URL=""
+        PR_URLS=""
+
+        # Create labels
+        gh label create "nextie" --description "Automated fix by nextie" --color "5319E7" 2>/dev/null || true
+        gh label create "nextie-cache" --description "Nextie caching recommendation" --color "0E8A16" 2>/dev/null || true
+
+        # Clean up branches from closed/merged nextie-cache PRs
+        STALE_BRANCHES=$(gh pr list \
+          --state closed \
+          --label "nextie-cache" \
+          --json headRefName,labels \
+          --jq '[.[] | select([.labels[].name] | index("nextie-retry") | not) | .headRefName] | .[]' 2>/dev/null || true)
+
+        if [ -n "$STALE_BRANCHES" ]; then
+          for branch in $STALE_BRANCHES; do
+            git push origin --delete "$branch" 2>/dev/null || true
+          done
+        fi
+
+        # Collect fingerprints from closed (unmerged) cache PRs (skip retry-labeled)
+        SKIPPED_FPS=$(gh pr list \
+          --state closed \
+          --label "nextie-cache" \
+          --json body,mergedAt,labels \
+          --jq '[.[] | select(.mergedAt == null) | select([.labels[].name] | index("nextie-retry") | not) | .body | capture("<!-- nextie-fingerprint:(?<fp>[a-f0-9]+) -->") | .fp] | .[]' \
+          2>/dev/null || true)
+
+        # Also check open PRs
+        OPEN_FPS=$(gh pr list \
+          --state open \
+          --label "nextie-cache" \
+          --json body \
+          --jq '[.[] | .body | capture("<!-- nextie-fingerprint:(?<fp>[a-f0-9]+) -->") | .fp] | .[]' \
+          2>/dev/null || true)
+
+        SKIP_SET=$(printf '%s\n%s' "$SKIPPED_FPS" "$OPEN_FPS")
+
+        BASE_SHA=$(git rev-parse HEAD)
+
+        # Write each fix to a separate file
+        FIX_COUNT=$(jq '.fixes | length' /tmp/nextie-cache-result.json)
+        for i in $(seq 0 $((FIX_COUNT - 1))); do
+          jq -c ".fixes[$i]" /tmp/nextie-cache-result.json > "/tmp/nextie-cache-fix-${i}.json"
+        done
+
+        for i in $(seq 0 $((FIX_COUNT - 1))); do
+          if [ "$CREATED" -ge "$MAX_PRS" ]; then
+            break
+          fi
+
+          fix=$(cat "/tmp/nextie-cache-fix-${i}.json")
+
+          CATEGORY=$(echo "$fix" | jq -r '.category')
+          FILE=$(echo "$fix" | jq -r '.file')
+          LINE=$(echo "$fix" | jq -r '.line')
+          MESSAGE=$(echo "$fix" | jq -r '.message')
+          DESCRIPTION=$(echo "$fix" | jq -r '.description')
+          EDITS_KEY=$(echo "$fix" | jq -r '[.edits[] | .file + ":" + .newText] | join("\u0000")')
+
+          FINGERPRINT=$(printf '%s\0%s\0%s\0%s' "$CATEGORY" "$FILE" "$MESSAGE" "$EDITS_KEY" | shasum -a 256 | cut -c1-16)
+
+          if echo "$SKIP_SET" | grep -qF "$FINGERPRINT"; then
+            SKIPPED=$((SKIPPED + 1))
+            continue
+          fi
+
+          SLUG=$(echo "$MESSAGE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-40 | sed 's/-$//')
+          BRANCH="nextie/cache/${SLUG}-${FINGERPRINT:0:8}"
+
+          git checkout "$BASE" --force 2>/dev/null
+          git clean -fd 2>/dev/null
+          git checkout -b "$BRANCH" "$BASE_SHA" 2>/dev/null || {
+            git branch -D "$BRANCH" 2>/dev/null
+            git checkout -b "$BRANCH" "$BASE_SHA"
+          }
+
+          nextie apply-fix "/tmp/nextie-cache-fix-${i}.json" .
+
+          git add .
+          git commit -m "perf(caching): ${MESSAGE}"
+          git push origin "$BRANCH" --set-upstream --force
+
+          {
+            echo "## Nextie: Caching"
+            echo ""
+            echo "**${FILE}:${LINE}** — ${MESSAGE}"
+            echo ""
+            echo "${DESCRIPTION}"
+            echo ""
+
+            EDIT_COUNT=$(echo "$fix" | jq '.edits | length')
+            if [ "$EDIT_COUNT" -gt 0 ]; then
+              echo "### Changes"
+              echo ""
+              echo "$fix" | jq -r '.edits[] | "**`\(.file):\(.startLine)-\(.endLine)`**\n```diff\n\(.newText | split("\n") | map("+ " + .) | join("\n"))\n```\n"'
+            fi
+
+            echo "---"
+            echo "> Merge this PR to apply the caching change, or close it to skip. Add the \`nextie-retry\` label before closing to re-suggest on the next run."
+            echo "> Generated by [nextie](https://github.com/functionform/nextie)"
+            echo ""
+            echo "<!-- nextie-fingerprint:${FINGERPRINT} -->"
+          } > /tmp/nextie-cache-pr-body.md
+
+          PR_TITLE=$(echo "perf(caching): ${MESSAGE}" | cut -c1-72)
+
+          PR_URL=$(gh pr create \
+            --title "$PR_TITLE" \
+            --body-file /tmp/nextie-cache-pr-body.md \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --label "nextie" \
+            --label "nextie-cache")
+
+          if [ -z "$FIRST_PR_URL" ]; then
+            FIRST_PR_URL="$PR_URL"
+          fi
+          PR_URLS="${PR_URLS}${PR_URL}\n"
+          CREATED=$((CREATED + 1))
+
+          echo "::notice::Created cache PR: $PR_URL"
+        done
+
+        echo "first-pr-url=$FIRST_PR_URL" >> $GITHUB_OUTPUT
+        echo "pr-urls=$PR_URLS" >> $GITHUB_OUTPUT
+        echo "prs-created=$CREATED" >> $GITHUB_OUTPUT
+        echo "::notice::Created $CREATED cache PRs ($SKIPPED skipped)"
